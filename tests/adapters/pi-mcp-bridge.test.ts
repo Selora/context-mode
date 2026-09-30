@@ -29,6 +29,279 @@ import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+// Display-only rendering uses host-supplied Pi components, not MCP payload edits.
+import { createContextModeRenderers, loadPiRendering } from "../../src/adapters/pi/renderers.js";
+import type { PiToolRegistration } from "../../src/adapters/pi/mcp-bridge.js";
+
+describe("Pi display-only rendering", () => {
+  class Text {
+    constructor(public text = "") {}
+    invalidate() {}
+    render(_width?: number) { return this.text.split("\n"); }
+  }
+  class Markdown extends Text {}
+  const highlightCode = vi.fn((code: string, language?: string) =>
+    [`highlight(${language}):${code}`],
+  );
+  const ui = { Text, Markdown, highlightCode, getMarkdownTheme: () => ({}) };
+  const theme = { bold: (s: string) => s, fg: (_color: string, s: string) => s };
+
+  it.each(["ctx_execute", "ctx_execute_file"])("highlights %s arguments, without mutating them", (name) => {
+    const args = Object.freeze({ language: "shell", code: "printf '%s' hello", path: "data.csv" });
+    const { renderCall } = createContextModeRenderers(name, ui);
+    const output = renderCall(args, theme, { expanded: true }).render(80).join("\n");
+    expect(output).toContain("```shell\nhighlight(bash):printf '%s' hello\n```");
+    expect(output).toContain("shell");
+    if (name === "ctx_execute_file") expect(output).toContain("data.csv");
+  });
+
+  it("keeps long calls compact and exposes full code on expansion", () => {
+    const args = { language: "python", code: Array.from({ length: 20 }, (_, i) => `print(${i})`).join("\n") };
+    const { renderCall } = createContextModeRenderers("ctx_execute", ui);
+    const collapsed = renderCall(args, theme, { expanded: false }).render(80).join("\n");
+    expect(collapsed).toContain("print(0)");
+    expect(collapsed).not.toContain("print(19)");
+    expect(collapsed).toContain("expand");
+    expect(renderCall(args, theme, { expanded: true }).render(80).join("\n")).toContain("print(19)");
+  });
+
+  it("handles incomplete streamed arguments and unknown languages", () => {
+    const { renderCall } = createContextModeRenderers("ctx_execute", ui);
+    expect(renderCall(undefined, theme, {}).render(80).join("\n")).toBe("ctx_execute");
+    expect(renderCall({ language: "future-lang", code: "abc" }, theme, {}).render(80).join("\n"))
+      .toContain("highlight(future-lang):abc");
+  });
+
+  it("shows useful search metadata", () => {
+    const { renderCall } = createContextModeRenderers("ctx_search", ui);
+    const text = renderCall({ queries: ["render code", "theme"], source: "docs" }, theme, {}).render(80).join("\n");
+    expect(text).toContain("render code");
+    expect(text).toContain("docs");
+  });
+
+  it("renders expanded search Markdown without touching model content", () => {
+    const output = "# Result\n\n```typescript\nconst n = 1;\n```";
+    const result = Object.freeze({ content: Object.freeze([{ type: "text", text: output }]) });
+    const { renderResult } = createContextModeRenderers("ctx_search", ui);
+    const component = renderResult(result, { expanded: true, isPartial: false }, theme, {});
+    expect(component).toBeInstanceOf(Markdown);
+    expect(component.render(80).join("\n")).toBe(output);
+    expect(result.content[0].text).toBe(output);
+    expect(renderResult(result, { expanded: false, isPartial: false }, theme, {}).render(80).join("\n"))
+      .toContain("preview truncated");
+  });
+
+  it("restores the hidden-output footer using the configured expand shortcut", () => {
+    const keyHint = vi.fn((_action: string, description: string) => `F2 ${description}`);
+    const { renderResult } = createContextModeRenderers("ctx_execute", { ...ui, keyHint });
+    const output = Array.from({ length: 12 }, (_, i) => `line ${i + 1}`).join("\n") + "\n";
+    const result = { content: [{ type: "text", text: output }] };
+    const collapsed = renderResult(result, { expanded: false, isPartial: false }, theme, {}).render(80).join("\n");
+    expect(collapsed).toContain("line 1\n");
+    expect(collapsed).toContain("preview truncated: 11 more lines");
+    expect(collapsed).toContain("F2 to expand");
+    expect(keyHint).toHaveBeenCalledWith("app.tools.expand", "to expand");
+    expect(renderResult(result, { expanded: true, isPartial: false }, theme, {}).render(80).join("\n"))
+      .toBe(output);
+    expect(result.content[0].text).toBe(output);
+  });
+
+  it("marks a shortened single line but not an ordinary line with a final newline", () => {
+    const { renderResult } = createContextModeRenderers("ctx_execute", ui);
+    for (const [output, truncated] of [["x".repeat(220), true], ["short output\n", false]] as const) {
+      const result = { content: [{ type: "text", text: output }] };
+      const collapsed = renderResult(result, { expanded: false, isPartial: false }, theme, {}).render(80).join("\n");
+      expect(collapsed.includes("preview truncated")).toBe(truncated);
+      expect(renderResult(result, { expanded: true, isPartial: false }, theme, {}).render(80).join("\n"))
+        .toBe(output);
+    }
+  });
+
+  it.each(["ctx_execute", "ctx_execute_file", "unknown_tool"])("keeps %s stdout literal", (name) => {
+    const output = "# not a heading\n*literal* _text_\n    keep indentation";
+    const { renderResult } = createContextModeRenderers(name, ui);
+    const component = renderResult({ content: [{ type: "text", text: output }] }, { expanded: true, isPartial: false }, theme, {});
+    expect(component).toBeInstanceOf(Text);
+    expect(component).not.toBeInstanceOf(Markdown);
+    expect(component.render(80).join("\n")).toBe(output);
+  });
+
+  it.each(["ctx_execute", "ctx_execute_file"])("shows %s source once, with JSON stdout highlighted independently", (name) => {
+    const args = Object.freeze({ language: "python", code: 'print(\'{"rows": 2}\')', path: "rows.csv" });
+    const json = ' {"rows": 2, "large": 9007199254740993}  \n';
+    const echo = `${name === "ctx_execute_file" ? "path=rows.csv\n" : ""}\`\`\`python\n${args.code}\n\`\`\`\n\n`;
+    const result = Object.freeze({ content: Object.freeze([{ type: "text", text: echo + json }]) });
+    const { renderCall, renderResult } = createContextModeRenderers(name, ui);
+    const call = renderCall(args, theme, { expanded: true }).render(80).join("\n");
+    const output = renderResult(result, { expanded: true, isPartial: false }, theme, { args }).render(80).join("\n");
+    expect(call).toContain("```python\n");
+    expect(output).toBe("highlight(json):" + json);
+    expect(result.content[0].text).toBe(echo + json);
+  });
+
+  it("only suppresses an exact, recognised source echo", () => {
+    const { renderResult } = createContextModeRenderers("ctx_execute", ui);
+    const args = { language: "python", code: "print(1)" };
+    const output = "```python\nprint(2)\n```\n\n2";
+    expect(renderResult({ content: [{ type: "text", text: output }] }, { expanded: true, isPartial: false }, theme, { args }).render(80).join("\n"))
+      .toContain("print(2)");
+    const echoed = "```python\nprint(1)\n```\n\n";
+    expect(renderResult({ content: [{ type: "text", text: echoed }] }, { expanded: true, isPartial: false }, theme, { args }).render(80).join("\n"))
+      .toBe("(no output)");
+  });
+
+  it("recognises the server's bounded source echo without deleting stdout", () => {
+    const args = { language: "python", code: "# " + "x".repeat(2200) };
+    const output = `\`\`\`python\n${args.code.slice(0, 2000)}\n… (truncated)\n\`\`\`\n\nretained stdout`;
+    const { renderResult } = createContextModeRenderers("ctx_execute", ui);
+    expect(renderResult({ content: [{ type: "text", text: output }] }, { expanded: true, isPartial: false }, theme, { args }).render(80).join("\n"))
+      .toBe("retained stdout");
+  });
+
+  it.each(['{"ok": true}', '[1, {"n": 2}]'])("detects complete JSON output: %s", (output) => {
+    const { renderResult } = createContextModeRenderers("ctx_execute", ui);
+    expect(renderResult({ content: [{ type: "text", text: output }] }, { expanded: true, isPartial: false }, theme, {}).render(80).join("\n"))
+      .toBe("highlight(json):" + output);
+  });
+
+  it.each(['{not json}', '[compiler] error', '{"ok": true}\ntrailing log', '42'])("leaves ambiguous output unchanged: %s", (output) => {
+    const { renderResult } = createContextModeRenderers("ctx_execute", ui);
+    expect(renderResult({ content: [{ type: "text", text: output }] }, { expanded: true, isPartial: false }, theme, {}).render(80).join("\n"))
+      .toBe(output);
+  });
+
+  it("also highlights JSON error responses", () => {
+    const output = '{"error":"failed"}';
+    const { renderResult } = createContextModeRenderers("ctx_execute", ui);
+    expect(renderResult({ content: [{ type: "text", text: output }] }, { expanded: true, isPartial: false }, theme, { isError: true }).render(80).join("\n"))
+      .toBe("highlight(json):" + output);
+  });
+
+  it("prefers native colours over JSON inference", () => {
+    const output = '\u001b[36m{"ok":true}\u001b[0m';
+    const { renderResult } = createContextModeRenderers("ctx_execute", ui);
+    expect(renderResult({ content: [{ type: "text", text: output }] }, { expanded: true, isPartial: false }, theme, {}).render(80).join("\n"))
+      .toBe(output);
+  });
+
+  it("does not insert nested fences into existing batch code blocks", () => {
+    const output = '## data\n\n```python\n# example\n\n{"ok":true}\n$ literal\n```';
+    const { renderResult } = createContextModeRenderers("ctx_batch_execute", ui);
+    expect(renderResult({ content: [{ type: "text", text: output }] }, { expanded: true, isPartial: false }, theme, {}).render(80).join("\n"))
+      .toBe(output);
+  });
+
+  it("uses a longer source fence when the code contains backticks", () => {
+    const { renderCall } = createContextModeRenderers("ctx_execute", ui);
+    const output = renderCall({ language: "python", code: 'print("```")' }, theme, { expanded: true }).render(80).join("\n");
+    expect(output).toContain("````python\n");
+    expect(output).toMatch(/\n````$/);
+  });
+
+  it("preserves native compiler colours on failure", () => {
+    const output = "\u001b[1;31merror:\u001b[0m failed\n  ^~~~";
+    const { renderResult } = createContextModeRenderers("ctx_execute", ui);
+    expect(renderResult({ content: [{ type: "text", text: output }] }, { expanded: true, isPartial: false }, theme, { isError: true }).render(80).join("\n"))
+      .toBe(output);
+  });
+
+  it("renders the actual batch report as Markdown with shell command blocks", () => {
+    const output = 'Executed 1 commands (5 lines, 0.1KB). Indexed 1 sections. Searched 1 queries.\n\n## Commands\n\n- data: `printf \'{"ok":true}\'`\n\n## Indexed Sections\n\n- data (0.1KB)\n\n## ok\n\n### data\n$ printf \'{"ok":true}\'\n\n{"ok":true}\n';
+    const result = { content: [{ type: "text", text: output }] };
+    const { renderResult } = createContextModeRenderers("ctx_batch_execute", ui);
+    const component = renderResult(result, { expanded: true, isPartial: false }, theme, {});
+    expect(component).toBeInstanceOf(Markdown);
+    const rendered = component.render(80).join("\n");
+    expect(rendered).toContain("## Indexed Sections");
+    expect(rendered).toContain("```bash\nprintf");
+    expect(rendered).toContain('```json\n{"ok":true}\n```');
+    expect(result.content[0].text).toBe(output);
+  });
+
+  it("infers result languages from fences and $ prompts, preserving raw ANSI stdout", () => {
+    const { renderResult } = createContextModeRenderers("ctx_execute", ui);
+    const output = "```javascript\nconst n = 1;\n```\n\n$ printf hello\n\u001b[32mhello\u001b[0m\n# literal";
+    const result = { content: [{ type: "text", text: output }] };
+    const displayed = renderResult(result, { expanded: true, isPartial: false }, theme, {}).render(80).join("\n");
+    expect(displayed).toContain("highlight(javascript):const n = 1;");
+    expect(displayed).toContain("$ highlight(bash):printf hello");
+    expect(displayed).toContain("\u001b[32mhello\u001b[0m\n# literal");
+    expect(result.content[0].text).toBe(output);
+  });
+
+  it("highlights shell echoes even in the collapsed result", () => {
+    const { renderResult } = createContextModeRenderers("ctx_batch_execute", ui);
+    const displayed = renderResult({ content: [{ type: "text", text: "$ printf hello\nhello" }] }, { expanded: false, isPartial: false }, theme, {}).render(80).join("\n");
+    expect(displayed).toContain("$ highlight(bash):printf hello");
+  });
+
+  it("handles tilde fences, language aliases, and incomplete fences", () => {
+    const { renderResult } = createContextModeRenderers("ctx_execute", ui);
+    const output = "~~~py\nprint(1)\n~~~\n```json\nunclosed";
+    const displayed = renderResult({ content: [{ type: "text", text: output }] }, { expanded: true, isPartial: false }, theme, {}).render(80).join("\n");
+    expect(displayed).toContain("highlight(python):print(1)");
+    expect(displayed).toContain("```json\nunclosed");
+  });
+
+  it("highlights batch command arguments as shell", () => {
+    const { renderCall } = createContextModeRenderers("ctx_batch_execute", ui);
+    const displayed = renderCall({ commands: [{ label: "test", command: "npm test" }] }, theme, {}).render(80).join("\n");
+    expect(displayed).toContain("$ highlight(bash):npm test");
+  });
+
+  it("shows partial, empty, and error results safely", () => {
+    const { renderResult } = createContextModeRenderers("ctx_search", ui);
+    expect(renderResult({}, { expanded: false, isPartial: true }, theme, {}).render(80).join("\n"))
+      .toContain("working");
+    expect(renderResult({}, { expanded: false, isPartial: false }, theme, {}).render(80).join("\n"))
+      .toContain("no output");
+    const component = renderResult({ content: [{ type: "text", text: "# error" }] }, { expanded: true, isPartial: false }, theme, { isError: true });
+    expect(component).not.toBeInstanceOf(Markdown);
+    expect(component.render(80).join("\n")).toBe("# error");
+  });
+
+  it("loads native Pi helpers without installing another Pi runtime", async () => {
+    const importer = vi.fn(async (_name: string) => ui);
+    const loaded = await loadPiRendering(importer);
+    expect(loaded?.highlightCode).toBe(highlightCode);
+    expect(importer.mock.calls.map(([name]) => name)).toEqual([
+      "@earendil-works/pi-tui", "@earendil-works/pi-coding-agent",
+    ]);
+  });
+
+  it("keeps registered MCP arguments, schema, and result bytes unchanged", async () => {
+    const bridge = await import("../../src/adapters/pi/mcp-bridge.js");
+    const schema = { type: "object", properties: { language: { type: "string" } } };
+    const output = "```javascript\nconsole.log(1)\n```\n\n1";
+    const args = Object.freeze({ language: "javascript", code: "console.log(1)" });
+    const registered: PiToolRegistration[] = [];
+    const spies: Array<{ mockRestore(): void }> = [
+      vi.spyOn(bridge.MCPStdioClient.prototype, "start").mockImplementation(() => {}),
+      vi.spyOn(bridge.MCPStdioClient.prototype, "initialize").mockResolvedValue(undefined),
+      vi.spyOn(bridge.MCPStdioClient.prototype, "listTools").mockResolvedValue([{ name: "ctx_execute", inputSchema: schema }]),
+    ];
+    const call = vi.spyOn(bridge.MCPStdioClient.prototype, "callTool").mockResolvedValue({ content: [{ type: "text", text: output }] });
+    spies.push(call);
+    try {
+      const handle = await bridge.bootstrapMCPTools({ registerTool: (tool) => registered.push(tool) }, "/unused.mjs", { _resolveJsRuntime: () => process.execPath, rendering: ui });
+      expect(registered[0].parameters).toBe(schema);
+      const result = await registered[0].execute("test", args);
+      expect(call).toHaveBeenCalledWith("ctx_execute", args);
+      expect(result).toEqual({ content: [{ type: "text", text: output }], details: {} });
+      const displayed = registered[0].renderResult!(result, { expanded: true, isPartial: false }, theme, {}) as Text;
+      expect(displayed.render(80).join("\n")).toContain("highlight(javascript)");
+      expect(result.content[0].text).toBe(output);
+      handle.shutdown();
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  });
+
+  it("allows plain rendering when the host does not supply Pi UI helpers", async () => {
+    await expect(loadPiRendering(async () => { throw new Error("not a Pi host"); })).resolves.toBeUndefined();
+  });
+});
+
 let scratch: string;
 
 beforeEach(() => {

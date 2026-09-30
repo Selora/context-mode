@@ -26,6 +26,7 @@ import { join } from "node:path";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { detectRuntimes } from "../../runtime.js";
 import { foreignWorkspaceEnv, foreignIdentificationEnv } from "../detect.js";
+import { createContextModeRenderers, type PiRendering } from "./renderers.js";
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -912,6 +913,8 @@ export interface BridgeHandle {
  */
 export interface BootstrapOptions {
   env?: NodeJS.ProcessEnv;
+  /** Host UI helpers resolved by Pi's TypeScript entrypoint (display only). */
+  rendering?: PiRendering;
   /** DI hook for tests: override the runtime resolver entirely. */
   _resolveJsRuntime?: () => string | null;
   /**
@@ -1018,6 +1021,8 @@ export async function bootstrapMCPTools(
 
   const tools = await client.listTools();
   const registered: string[] = [];
+  const rendering = options.rendering;
+  if (!rendering) diag("[context-mode] Pi UI helpers unavailable; using plain tool rendering.", "debug");
 
   for (const tool of tools) {
     pi.registerTool({
@@ -1029,8 +1034,10 @@ export async function bootstrapMCPTools(
       // for type inference). Empty-object fallback keeps tools that
       // declare no parameters callable.
       parameters: tool.inputSchema ?? { type: "object", properties: {} },
-      renderCall: createContextModeCallRenderer(tool.name),
-      renderResult: createContextModeResultRenderer(tool.name),
+      ...(rendering ? createContextModeRenderers(tool.name, rendering) : {
+        renderCall: createContextModeCallRenderer(tool.name),
+        renderResult: createContextModeResultRenderer(tool.name),
+      }),
       async execute(_toolCallId, params) {
         const result = await client.callTool(tool.name, params ?? {});
         const text = (result.content ?? [])

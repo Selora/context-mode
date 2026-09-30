@@ -1041,6 +1041,25 @@ Full configs: [`configs/kiro/mcp.json`](configs/kiro/mcp.json) | [`configs/kiro/
 
 **Routing:** Automatic. The extension registers all key lifecycle events (`tool_call`, `tool_result`, `session_start`, `session_before_compact`), providing full session continuity and routing enforcement.
 
+**Terminal display:** Tool calls show language, paths, queries, and highlighted execution code
+in a fenced block. Shortened result previews end with a truncation hint and the configured
+expand shortcut; expanding reveals the full returned result. Recognised duplicate source
+echoes are hidden in the display, not removed from the response. Search/index summaries and
+batch reports render as Markdown, with highlighted command blocks in batch reports.
+Execution results highlight language-tagged code fences and `$ command` echoes as shell.
+Complete JSON objects/arrays are detected and coloured without reformatting; invalid or
+ambiguous output stays plain. Existing ANSI colours take precedence, including compiler
+errors. No colour-forcing flags, environment changes, or pseudo-terminals are introduced;
+programs that disable colour when piped may still produce plain output.
+Pi's native components wrap long lines and follow the active theme. This is display-only:
+tool inputs, MCP responses, indexing, and model-visible content are unchanged. Hosts without
+Pi's UI helpers retain the plain renderer.
+
+When opening interactive sessions containing saved `ctx_*` calls/results on the active
+branch, the existing MCP bridge starts before Pi draws history, restoring those renderers.
+This can add initialization latency; saved commands are never replayed. Sessions without
+such history, non-interactive sessions, and CLI-only commands retain lazy startup.
+
 </details>
 
 <details>
@@ -1188,6 +1207,13 @@ When output exceeds 5 KB and an `intent` is provided, Context Mode switches to i
 The `ctx_index` tool chunks markdown content by headings while keeping code blocks intact, then stores them in a **SQLite FTS5** (Full-Text Search 5) virtual table. The SQLite backend is selected automatically at runtime: `bun:sqlite` on Bun, `node:sqlite` on Node.js >= 22.5, and `better-sqlite3` everywhere else. Search uses **BM25 ranking** — a probabilistic relevance algorithm that scores documents based on term frequency, inverse document frequency, and document length normalization. **Porter stemming** is applied at index time so "running", "runs", and "ran" match the same stem. Titles and headings are weighted **5x** in BM25 scoring for precise navigational queries.
 
 When you call `ctx_search`, it returns relevant content snippets focused around matching query terms — not full documents, not approximations, the actual indexed content with smart extraction around what you're looking for. `ctx_fetch_and_index` extends this to URLs: fetch, convert HTML to markdown, chunk, index. The raw page never enters context. Use the `contentType` parameter to filter results by type (e.g. `code` or `prose`).
+
+For file-backed search results, known code/config filetypes are returned in language-labelled
+code fences; logs and ambiguous code filetypes use plain fences. The stored backing path—not
+the source label or `contentType` filter—determines this formatting. Headers stay outside the
+fences, and Markdown/documentation, unknown filetypes, unbacked content and other search
+origins keep their existing formatting. This changes the returned Markdown for all clients,
+not the indexed content, ranking or snippet extraction; syntax colouring depends on the client.
 
 ### Ranking: Reciprocal Rank Fusion
 

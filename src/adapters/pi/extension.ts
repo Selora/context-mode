@@ -23,6 +23,7 @@ import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
 import { bootstrapMCPTools, makeBridgeDiag, isForegroundSession, type BridgeHandle } from "./mcp-bridge.js";
+import type { PiRendering } from "./renderers.js";
 import { PiAdapter } from "./index.js";
 
 // ── Pi Tool Name Mapping ─────────────────────────────────
@@ -328,20 +329,21 @@ function handleCommandText(
 // #534 short-lived help/version orphan class and the #809 package-command hang
 // (the bridge child's stdio handles kept Pi alive after `install`/`list`).
 //
-// The robust signal is Pi's agent lifecycle itself. `before_agent_start` fires
-// only for invocations that are about to dispatch a model call, including
-// print-mode subagents (`pi --mode json -p --no-session`). We start and await
-// the bridge from that hook so ctx_* tools are present before Pi snapshots the
-// tool registry, while CLI-only commands never spawn a bridge at all.
+// Normally `before_agent_start` starts and awaits the bridge before Pi snapshots
+// the tool registry, including print-mode subagents. The sole earlier path is
+// an interactive session_start with saved ctx_* history: Pi awaits that handler
+// before drawing messages, so the same bridge can restore their renderers.
+// Discovery and CLI-only commands still never spawn a bridge.
 
 function startPiMCPBridge(
   pi: any,
   serverBundle: string,
   shouldKeepHandle: () => boolean,
   foreground: boolean,
+  rendering?: PiRendering,
 ): Promise<void> {
   if (existsSync(serverBundle)) {
-    _mcpBridgeReady = bootstrapMCPTools(pi, serverBundle, { foreground }).then(
+    _mcpBridgeReady = bootstrapMCPTools(pi, serverBundle, { foreground, rendering }).then(
       (handle) => {
         if (shouldKeepHandle()) {
           _mcpBridge = handle;
@@ -426,7 +428,7 @@ export function resolvePiWorkspaceDir(opts: {
 // ── Extension entry point ────────────────────────────────
 
 /** Pi extension default export. Called once by Pi runtime with the extension API. */
-export default function piExtension(pi: any): void {
+export default function piExtension(pi: any, rendering?: PiRendering): void {
   const buildDir = dirname(fileURLToPath(import.meta.url));
   const pluginRoot = resolve(buildDir, "..", "..", "..");
   const serverBundle = resolve(pluginRoot, "server.bundle.mjs");
@@ -441,6 +443,7 @@ export default function piExtension(pi: any): void {
       serverBundle,
       () => mcpBridgeStarted && mcpBridgeGeneration === generation,
       foreground,
+      rendering,
     );
   };
   // Issue #545 — Pi workspace resolver. PI_CONFIG_DIR is Pi's CONFIG dir
@@ -464,7 +467,7 @@ export default function piExtension(pi: any): void {
 
   // ── 1. session_start — Initialize session ──────────────
 
-  pi.on("session_start", (_event: any, ctx: any) => {
+  pi.on("session_start", async (_event: any, ctx: any) => {
     try {
       _sessionId = deriveSessionId(ctx ?? {});
       db.ensureSession(_sessionId, projectDir);
@@ -474,6 +477,21 @@ export default function piExtension(pi: any): void {
       if (!_sessionId) {
         _sessionId = `pi-${Date.now()}`;
       }
+    }
+
+    // Restore tool definitions/renderers before Pi draws saved history. Inspect
+    // only the loaded branch; never replay calls or start MCP just for CLI/RPC.
+    if (rendering && ctx?.mode === "tui") {
+      const isContextTool = (name: unknown) => typeof name === "string" && name.startsWith("ctx_");
+      const branch = ctx.sessionManager?.getBranch?.() ?? [];
+      const hasSavedTools = branch.some((entry: any) => {
+        if (entry.type !== "message") return false;
+        const message = entry.message;
+        return (message?.role === "toolResult" && isContextTool(message.toolName)) ||
+          (message?.role === "assistant" && Array.isArray(message.content) &&
+            message.content.some((part: any) => part.type === "toolCall" && isContextTool(part.name)));
+      });
+      if (hasSavedTools) await ensureMCPBridge(isForegroundSession(ctx));
     }
   });
 
@@ -607,10 +625,10 @@ export default function piExtension(pi: any): void {
   pi.on("before_agent_start", async (event: any, ctx: any) => {
     try {
       _pendingContext = ""; // Reset — will be filled below if events exist
-      // Lazily start and await the MCP bridge only when Pi is about to
-      // dispatch a real agent turn. This is the non-brittle #534/#809 guard:
-      // help/version/package/config CLI paths may load the extension, but they
-      // never fire before_agent_start, so they never spawn server.bundle.mjs.
+      // Lazily start and await the MCP bridge for a real agent turn, unless
+      // session_start already restored it for saved history. The #534/#809
+      // protection remains: help/version/package/config paths only discover
+      // the extension, so they never spawn server.bundle.mjs.
       // Subagents (`pi --mode json -p --no-session`) do fire this hook; awaiting
       // here ensures ctx_* tools are registered before Pi snapshots the tool
       // registry for the model call. Resolves on bootstrap failure too — the
@@ -621,17 +639,11 @@ export default function piExtension(pi: any): void {
       // pause never drops its ctx_* tools. Subagents (hasUI:false) keep the
       // reaper so abandoned children can't accumulate (#854).
       //
-      // INVARIANT — deciding foreground on the FIRST before_agent_start is safe
-      // even though the bridge spawns single-flight (first-wins, no sticky
-      // latch): Pi wires the interactive uiContext inside `mode.init()`, which
-      // main.ts AWAITS before dispatching the first prompt — and
-      // before_agent_start is emitted only from the per-turn prompt path. So the
-      // foreground session's first hook ALWAYS observes hasUI:true; subagents are
-      // provably hasUI:false. There is no early-init window where the foreground
-      // transiently reads hasUI:false (that window is scoped to a separate,
-      // buffered credential event). Do NOT add a latch here — it would guard an
-      // unreachable state. (Verified against oh-my-pi: main.ts init→prompt order,
-      // interactive-mode.ts uiContext wiring, executor.ts subagent hasUI:false.)
+      // Foreground is decided at the first start, whether this turn or a saved
+      // TUI session's session_start. Pi binds the interactive UI context before
+      // session_start and before any prompt (Pi 0.99.1: bindCurrentSessionExtensions
+      // precedes renderInitialMessages). The shared single-flight guard keeps
+      // the original foreground choice; no additional latch is needed.
       await ensureMCPBridge(isForegroundSession(ctx));
 
       if (!_sessionId) return;

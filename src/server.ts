@@ -67,6 +67,7 @@ import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
 import { parseCodexContextModePluginRoot } from "./adapters/codex/index.js";
 import { getHookScriptPaths } from "./util/hook-config.js";
 import { stripJsonComments } from "./util/jsonc.js";
+import { fencedCode, languageForSourcePath } from "./util/code-display.js";
 import { resolveClaudeConfigDir } from "./util/claude-config.js";
 import { resolveProjectDir } from "./util/project-dir.js";
 import { loadDatabase } from "./db-base.js";
@@ -1364,6 +1365,26 @@ export function extractSnippet(
   }
 
   return parts.join("\n\n");
+}
+
+/** Format each search hit before flattening the response. Only confirmed backing
+ * code/log files are fenced; Markdown, unbacked content and other search origins
+ * keep their existing formatting. The indexed content and snippet bytes stay intact. */
+export function formatSearchResult(
+  store: Pick<ContentStore, "getSourceMeta">,
+  result: Pick<SearchResult, "title" | "content" | "source" | "timestamp" | "highlighted"> & { origin?: string },
+  query: string,
+): string {
+  const origin = result.origin || "current-session";
+  const ts = result.timestamp ? result.timestamp.slice(0, 16).replace("T", " ") : "";
+  const header = `--- [${origin}${ts ? " | " + ts : ""} | ${result.source}] ---`;
+  const heading = `### ${result.title}`;
+  const snippet = extractSnippet(result.content, query, 1500, result.highlighted);
+  // Other origins can share a label with this store without sharing its file.
+  const filePath = origin === "current-session" ? store.getSourceMeta(result.source)?.filePath : undefined;
+  const language = languageForSourcePath(filePath);
+  const body = language === undefined ? snippet : fencedCode(snippet, language);
+  return `${header}\n${heading}\n\n${body}`;
 }
 
 export type BatchQueryScope = "batch" | "global";
@@ -2742,14 +2763,7 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
         }
 
         const formatted = results
-          .map((r, i) => {
-            const origin = (r as any).origin || "current-session";
-            const ts = (r as any).timestamp ? (r as any).timestamp.slice(0, 16).replace("T", " ") : "";
-            const header = `--- [${origin}${ts ? " | " + ts : ""} | ${r.source}] ---`;
-            const heading = `### ${r.title}`;
-            const snippet = extractSnippet(r.content, q, 1500, r.highlighted);
-            return `${header}\n${heading}\n\n${snippet}`;
-          })
+          .map((r) => formatSearchResult(store, r, q))
           .join("\n\n");
 
         sections.push(`## ${q}\n\n${formatted}`);

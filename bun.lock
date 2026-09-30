@@ -23,6 +23,14 @@
         "typescript": "^5.7.0",
         "vitest": "^4.0.18",
       },
+      "peerDependencies": {
+        "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*",
+      },
+      "optionalPeers": [
+        "@earendil-works/pi-coding-agent",
+        "@earendil-works/pi-tui",
+      ],
     },
   },
   "packages": {
