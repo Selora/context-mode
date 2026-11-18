@@ -1,0 +1,12 @@
+{
+  "results": {
+    "queries": false,
+    "scope": false,
+    "source": false,
+    "offset": false,
+    "sort": false,
+    "after": false,
+    "zeroTimeline": false,
+    "zeroRelevance": false
+  }
+}
