@@ -15,6 +15,7 @@ import { ownJournal } from "../core/journal/own-call.ts";
 import { resolveProject } from "../core/project/resolve.ts";
 import { TOOLS, checkCall, type RegisteredTool } from "../core/tools/registry.ts";
 import { INSTRUCTIONS } from "./server.ts";
+import { loadPiRendering, piRenderers, type PiRendering, type PiRenderers } from "./pi-render.ts";
 
 /** The Pi handler context fields this file reads (impl/10 §10). */
 export interface PiContext {
@@ -27,7 +28,7 @@ export interface PiToolResult {
   details: Record<string, unknown>;
 }
 
-export interface PiTool {
+export interface PiTool extends Partial<PiRenderers> {
   name: string;
   label: string;
   description: string;
@@ -134,11 +135,14 @@ function toPi(reply: ToolReply): PiToolResult {
 // can a Pi user. "omp" joins AGENT_IDS in M4 (D-OMP-ROW-1); until then handleHook names it on its stderr line.
 export type PiHostId = "pi" | "omp";
 
-export default function piExtension(pi: PiApi): void {
-  hostExtension(pi, "pi");
+export default async function piExtension(pi: PiApi): Promise<void> {
+  // Keep the imports in the extension bundle that Pi's loader evaluates. Pi supplies
+  // these modules; neither the package nor the OMP entry requires them.
+  const ui = await loadPiRendering((name) => import(name));
+  hostExtension(pi, "pi", ui);
 }
 
-export function hostExtension(pi: PiApi, host: PiHostId = "pi"): void {
+export function hostExtension(pi: PiApi, host: PiHostId = "pi", ui?: PiRendering): void {
   const agent = host as AgentId;
   const env = process.env;
   let sessionId = ""; // impl/10 §10: ctx.sessionManager.getSessionId(), captured once (impl/12 §3.2)
@@ -204,6 +208,7 @@ export function hostExtension(pi: PiApi, host: PiHostId = "pi"): void {
       description: tool.description,
       parameters: z.toJSONSchema(tool.schema),
       loadMode: "essential",
+      ...(ui && piRenderers(tool.name, ui)),
       execute: async (_toolCallId, params, signal) => toPi(await runTool(tool, params, signal)),
     };
   }
